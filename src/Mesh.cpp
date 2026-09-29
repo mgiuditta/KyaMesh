@@ -251,7 +251,7 @@ Renderer::SimpleMesh* Renderer::Kya::G3D::Strip::GetSimpleMesh(int textureLayerI
 		meshName += "_layer_";
 		meshName += std::to_string(textureLayerIndex);
 
-		layerSimpleMeshes[layerIndex] = std::make_unique<SimpleMesh>(meshName, pSimpleMesh->GetPrim());
+		layerSimpleMeshes[layerIndex] = std::make_unique<SimpleMesh>(meshName, pSimpleMesh->GetPrim(), pSimpleMesh->GetStripFlags());
 		PreProcessVertices(textureLayerIndex, layerSimpleMeshes[layerIndex].get());
 	}
 
@@ -281,7 +281,7 @@ void Renderer::Kya::G3D::Cluster::ProcessStrip(ed_3d_strip* pStrip, const int st
 	meshName += "_";
 	meshName += std::to_string(stripIndex);
 
-	strip.pSimpleMesh = std::make_unique<SimpleMesh>(meshName, prim);
+	strip.pSimpleMesh = std::make_unique<SimpleMesh>(meshName, prim, pStrip->flags);
 
 	strip.PreProcessVertices(0, strip.pSimpleMesh.get());
 }
@@ -324,7 +324,7 @@ void Renderer::Kya::G3D::Object::ProcessStrip(ed_3d_strip* pStrip, const int hei
 	meshName += "_";
 	meshName += std::to_string(stripIndex);
 
-	strip.pSimpleMesh = std::make_unique<SimpleMesh>(meshName, prim);
+	strip.pSimpleMesh = std::make_unique<SimpleMesh>(meshName, prim, pStrip->flags);
 
 	strip.PreProcessVertices(0, strip.pSimpleMesh.get());
 }
@@ -443,7 +443,7 @@ void Renderer::Kya::G3D::ProcessCluster(ed_g3d_cluster* pCluster)
 	bool bProcessedStrip = false;
 
 	if ((stripCount != 0) && (bProcessedStrip = true, stripCount != 0)) {
-		ed_Chunck* pMBNK = LOAD_POINTER_CAST(ed_Chunck*, pCluster->pMBNK);
+		ed_Chunck* pMBNK = LOAD_POINTER_CAST(ed_Chunck*, pCluster->clusterDetails.pMBNK);
 		ed_3d_strip* p3DStrip = LOAD_POINTER_CAST(ed_3d_strip*, pCluster->p3DStrip);
 
 		uint stripIndex = 0;
@@ -461,13 +461,13 @@ void Renderer::Kya::G3D::ProcessCluster(ed_g3d_cluster* pCluster)
 		bProcessedStrip = true;
 	}
 
-	uint spriteCount = pCluster->clusterDetails.spriteCount;
+	uint spriteCount = pCluster->spriteCount;
 
 	if (spriteCount != 0) {
 
 	}
 
-	uint clusterHierCount = pCluster->clusterDetails.clusterHierCount;
+	uint clusterHierCount = pCluster->clusterHierCount;
 
 	if (clusterHierCount != 0) {
 		ed_Chunck* pHASH = reinterpret_cast<ed_Chunck*>(pCluster + 1);
