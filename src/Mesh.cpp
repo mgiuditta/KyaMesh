@@ -7,6 +7,15 @@
 #include "port.h"
 #include "port/vu1_emu.h"
 
+#include <glm/glm.hpp>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <tuple>
+#include <unordered_set>
+
 #ifdef LOG_SUPPORT
 #define MESH_LOG(level, format, ...) MY_LOG_CATEGORY("MeshLibrary", level, format, ##__VA_ARGS__)
 //#define MESH_LOG_TRACE(level, format, ...) MY_LOG_CATEGORY("MeshLibrary", level, format, ##__VA_ARGS__)
@@ -86,6 +95,216 @@ namespace Renderer
 			}
 
 			return DrawMode::v32;
+		}
+
+		static std::atomic<int> gSmoothLevel = 0;
+
+		// KYA_MESH_SMOOTH=<n> overrides the setting: each triangle edge is split into n segments and the new
+		// points move onto a PN-triangle patch, so low-poly silhouettes round off. Below 2 keeps the original mesh.
+		static int GetSmoothLevel()
+		{
+			static const char* pOverride = getenv("KYA_MESH_SMOOTH");
+			const int value = pOverride ? atoi(pOverride) : gSmoothLevel.load();
+			return value < 2 ? 0 : std::min(value, 4);
+		}
+
+		using Vertex = Renderer::GSVertexUnprocessedNormal;
+
+		static glm::vec3 Position(const Vertex& vtx) { return { vtx.XYZFlags.fXYZ[0], vtx.XYZFlags.fXYZ[1], vtx.XYZFlags.fXYZ[2] }; }
+		static glm::vec3 Normal(const Vertex& vtx) { return { vtx.normal.fNormal[0], vtx.normal.fNormal[1], vtx.normal.fNormal[2] }; }
+		static uint32_t Bone(const Vertex& vtx) { return vtx.XYZFlags.flags & 0x7ff; }
+
+		struct PNEdge
+		{
+			glm::vec3 b0; // control point next to the first corner
+			glm::vec3 b1; // control point next to the second corner
+			glm::vec3 n;  // quadratic normal control point
+		};
+
+		static PNEdge MakePNEdge(const glm::vec3& p0, const glm::vec3& n0, const glm::vec3& p1, const glm::vec3& n1, bool bCurved)
+		{
+			const glm::vec3 d = p1 - p0;
+			const glm::vec3 nSum = n0 + n1;
+			if (glm::dot(nSum, nSum) < 1e-6f) {
+				return { p0 + d / 3.0f, p1 - d / 3.0f, n0 };
+			}
+
+			if (!bCurved || glm::dot(d, d) < 1e-12f) {
+				return { p0 + d / 3.0f, p1 - d / 3.0f, glm::normalize(nSum) };
+			}
+
+			const glm::vec3 b0 = (2.0f * p0 + p1 - glm::dot(d, n0) * n0) / 3.0f;
+			const glm::vec3 b1 = (2.0f * p1 + p0 + glm::dot(d, n1) * n1) / 3.0f;
+			const float v = 2.0f * glm::dot(d, n0 + n1) / glm::dot(d, d);
+			const glm::vec3 n = glm::normalize(n0 + n1 - v * d);
+			return { b0, b1, n };
+		}
+
+		// A triangle can only be curved when all three corners sit on the same bone: positions are in bone space.
+		static bool CanCurve(const Vertex& a, const Vertex& b, const Vertex& c)
+		{
+			if (Bone(a) == 0 || Bone(a) != Bone(b) || Bone(a) != Bone(c)) {
+				return false;
+			}
+
+			for (const Vertex* pVtx : { &a, &b, &c }) {
+				const float length = glm::length(Normal(*pVtx));
+				if (length < 0.5f || length > 1.5f) {
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		static void SmoothMesh(Renderer::NativeVertexBufferData& data, const int level)
+		{
+			const size_t indexCount = data.GetIndexTail();
+			const size_t vertexCount = data.GetVertexTail();
+			if (indexCount == 0 || indexCount % 3 != 0) {
+				return;
+			}
+
+			const Vertex* pVertices = data.vertex.buff;
+			const uint16_t* pIndices = data.index.buff;
+
+			// Edges touching a triangle that cannot curve stay straight, so the neighbours do not crack.
+			// ponytail: keyed by position + bone within one strip; edges shared across strips may still crack.
+			auto edgeKey = [&](uint16_t i0, uint16_t i1) {
+				glm::vec3 a = Position(pVertices[i0]);
+				glm::vec3 b = Position(pVertices[i1]);
+				if (std::tie(a.x, a.y, a.z) > std::tie(b.x, b.y, b.z)) {
+					std::swap(a, b);
+				}
+
+				char key[sizeof(float) * 6 + sizeof(uint32_t)];
+				memcpy(key, &a, sizeof(a));
+				memcpy(key + sizeof(a), &b, sizeof(b));
+				const uint32_t bone = Bone(pVertices[i0]);
+				memcpy(key + sizeof(a) * 2, &bone, sizeof(bone));
+				return std::string(key, sizeof(key));
+			};
+
+			std::unordered_set<std::string> straightEdges;
+			size_t curvedTriangles = 0;
+			for (size_t t = 0; t < indexCount; t += 3) {
+				const uint16_t* pTri = pIndices + t;
+				if (CanCurve(pVertices[pTri[0]], pVertices[pTri[1]], pVertices[pTri[2]])) {
+					curvedTriangles++;
+					continue;
+				}
+
+				for (int e = 0; e < 3; e++) {
+					straightEdges.insert(edgeKey(pTri[e], pTri[(e + 1) % 3]));
+				}
+			}
+
+			if (curvedTriangles == 0) {
+				return;
+			}
+
+			// Every curved triangle becomes level^2 triangles with its own (level+1)(level+2)/2 vertices.
+			const size_t pointsPerTriangle = (level + 1) * (level + 2) / 2;
+			const size_t triangleCount = indexCount / 3;
+			const size_t newVertexCount = vertexCount + curvedTriangles * pointsPerTriangle;
+			const size_t newIndexCount = (triangleCount - curvedTriangles) * 3 + curvedTriangles * level * level * 3;
+			if (newVertexCount > 0xffff) {
+				return;
+			}
+
+			std::vector<Vertex> vertices(pVertices, pVertices + vertexCount);
+			std::vector<uint16_t> indices;
+			vertices.reserve(newVertexCount);
+			indices.reserve(newIndexCount);
+
+			for (size_t t = 0; t < indexCount; t += 3) {
+				const uint16_t* pTri = pIndices + t;
+				const Vertex corners[3] = { pVertices[pTri[0]], pVertices[pTri[1]], pVertices[pTri[2]] };
+
+				if (!CanCurve(corners[0], corners[1], corners[2])) {
+					indices.insert(indices.end(), pTri, pTri + 3);
+					continue;
+				}
+
+				glm::vec3 p[3];
+				glm::vec3 n[3];
+				for (int c = 0; c < 3; c++) {
+					p[c] = Position(corners[c]);
+					n[c] = glm::normalize(Normal(corners[c]));
+				}
+
+				PNEdge edges[3];
+				for (int e = 0; e < 3; e++) {
+					const int c1 = (e + 1) % 3;
+					const bool bCurved = straightEdges.find(edgeKey(pTri[e], pTri[c1])) == straightEdges.end();
+					edges[e] = MakePNEdge(p[e], n[e], p[c1], n[c1], bCurved);
+				}
+
+				// Bezier triangle with corners p0 (w), p1 (u), p2 (v).
+				const glm::vec3 b300 = p[0], b030 = p[1], b003 = p[2];
+				const glm::vec3 b210 = edges[0].b0, b120 = edges[0].b1;
+				const glm::vec3 b021 = edges[1].b0, b012 = edges[1].b1;
+				const glm::vec3 b102 = edges[2].b0, b201 = edges[2].b1;
+				const glm::vec3 e = (b210 + b120 + b021 + b012 + b102 + b201) / 6.0f;
+				const glm::vec3 b111 = e + (e - (b300 + b030 + b003) / 3.0f) / 2.0f;
+				const glm::vec3 n110 = edges[0].n, n011 = edges[1].n, n101 = edges[2].n;
+
+				const uint16_t base = static_cast<uint16_t>(vertices.size());
+				for (int row = 0; row <= level; row++) {
+					for (int col = 0; col <= level - row; col++) {
+						const float v = float(row) / float(level);
+						const float u = float(col) / float(level);
+						const float w = 1.0f - u - v;
+
+						Vertex vtx = corners[0];
+						const glm::vec3 pos = b300 * (w * w * w) + b030 * (u * u * u) + b003 * (v * v * v)
+							+ b210 * (3.0f * w * w * u) + b120 * (3.0f * w * u * u) + b201 * (3.0f * w * w * v)
+							+ b021 * (3.0f * u * u * v) + b102 * (3.0f * w * v * v) + b012 * (3.0f * u * v * v)
+							+ b111 * (6.0f * w * u * v);
+						const glm::vec3 normal = glm::normalize(n[0] * (w * w) + n[1] * (u * u) + n[2] * (v * v)
+							+ n110 * (w * u) + n011 * (u * v) + n101 * (w * v));
+
+						for (int i = 0; i < 3; i++) {
+							vtx.XYZFlags.fXYZ[i] = pos[i];
+							vtx.normal.fNormal[i] = normal[i];
+						}
+
+						vtx.normal.fNormal[3] = corners[0].normal.fNormal[3] * w + corners[1].normal.fNormal[3] * u + corners[2].normal.fNormal[3] * v;
+						for (int i = 0; i < 2; i++) {
+							vtx.STQ.ST[i] = static_cast<int32_t>(std::lround(float(corners[0].STQ.ST[i]) * w + float(corners[1].STQ.ST[i]) * u + float(corners[2].STQ.ST[i]) * v));
+						}
+
+						for (int i = 0; i < 4; i++) {
+							vtx.RGBA[i] = static_cast<uint32_t>(std::lround(float(corners[0].RGBA[i]) * w + float(corners[1].RGBA[i]) * u + float(corners[2].RGBA[i]) * v));
+						}
+
+						vertices.push_back(vtx);
+					}
+				}
+
+				// Index of the grid point at (row, col).
+				auto at = [&](int row, int col) {
+					return static_cast<uint16_t>(base + row * (level + 1) - row * (row - 1) / 2 + col);
+				};
+
+				for (int row = 0; row < level; row++) {
+					for (int col = 0; col < level - row; col++) {
+						indices.insert(indices.end(), { at(row, col), at(row, col + 1), at(row + 1, col) });
+						if (col < level - row - 1) {
+							indices.insert(indices.end(), { at(row, col + 1), at(row + 1, col + 1), at(row + 1, col) });
+						}
+					}
+				}
+			}
+
+			_aligned_free(data.vertex.buff);
+			_aligned_free(data.index.buff);
+			data.Init(static_cast<int>(vertices.size()), static_cast<int>(indices.size()));
+			memcpy(data.vertex.buff, vertices.data(), vertices.size() * sizeof(Vertex));
+			memcpy(data.index.buff, indices.data(), indices.size() * sizeof(uint16_t));
+			data.vertex.head = 0;
+			data.vertex.tail = data.vertex.next = vertices.size();
+			data.index.tail = indices.size();
 		}
 	}
 }
@@ -232,7 +451,16 @@ void Renderer::Kya::G3D::Strip::PreProcessVertices(int textureLayerIndex, Simple
 		vtxOffset += 2;
 	}
 
+	if (GetSmoothLevel() > 0) {
+		SmoothMesh(vertexBufferData, GetSmoothLevel());
+	}
+
 	//assert(internalVertexBuffer.GetIndexTail() > 0);
+}
+
+void Renderer::Kya::SetMeshSmoothLevel(int level)
+{
+	gSmoothLevel = level;
 }
 
 Renderer::SimpleMesh* Renderer::Kya::G3D::Strip::GetSimpleMesh(int textureLayerIndex) const

@@ -125,6 +125,9 @@ namespace Renderer
 			std::vector<G3D> gMeshes;
 		};
 
+		// Applies to meshes processed after the call (next level load).
+		void SetMeshSmoothLevel(int level);
+
 		const MeshLibrary& GetMeshLibrary();
 		MeshLibrary& GetMeshLibraryMutable();
 	}

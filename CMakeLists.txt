@@ -21,7 +21,7 @@ endif()
 if(Standalone)
 	target_compile_definitions(${TargetName} PRIVATE STANDALONE)
 else()
-	target_link_libraries(${TargetName} PRIVATE Kya Renderer)
+	target_link_libraries(${TargetName} PRIVATE Kya Renderer glm)
 endif()
 
 target_include_directories(${TargetName} PUBLIC "src")
